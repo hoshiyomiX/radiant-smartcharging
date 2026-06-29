@@ -1,0 +1,289 @@
+; =============================================================================
+; rsc CIL policy patch — Direct append to vendor_sepolicy.cil
+; =============================================================================
+;
+; Target device: Infinix X695C (MTK Helio G95, Android 11, RP1A.200720.011)
+; Vendor CIL version: 30.0 (plat_sepolicy_vers.txt)
+;
+; Audit findings (against vendor_sepolicy.cil):
+;   * /sys/devices/platform/battery/  — ALREADY labeled sysfs_batteryinfo_30_0
+;     via genfscon at line 345 of vendor_sepolicy.cil. We do NOT relabel;
+;     we grant rsc write access to the existing type.
+;   * /proc/mtk_battery_cmd/* — UNLABELED (no genfscon entry exists).
+;     Falls to generic `proc` type. We add a new genfscon + dedicated type
+;     `rsc_mtk_battery_proc` to avoid touching the neverallow rules that
+;     block vendor domains from writing to generic `proc`.
+;   * factory, meta_tst, fuelgauged already have write access to
+;     sysfs_batteryinfo_30_0 — so allowing rsc to write there is
+;     consistent with existing vendor practice.
+;
+; Install path:
+;   Append this entire file to:
+;     /vendor/etc/selinux/vendor_sepolicy.cil
+;
+;   Then ALSO apply file_contexts.patch to:
+;     /vendor/etc/selinux/vendor_file_contexts
+;
+;   IMPORTANT: Android 11 vendor CIL is loaded at boot time. You do NOT
+;   need to rebuild precompiled_sepolicy — Android's init recompiles
+;   vendor_sepolicy.cil + plat_pub_versioned.cil on every boot if the
+;   sha256 hash mismatches. To force a recompile, delete or invalidate
+;     /vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256
+;
+; CIL syntax notes:
+;   - Comments start with ; (not #)
+;   - All statements wrapped in parentheses
+;   - Types must be declared BEFORE being referenced
+;   - typeattributeset appends to an existing typeattribute — order matters
+
+; =============================================================================
+; 1. Type declarations
+; =============================================================================
+
+; rsc domain — the running daemon process
+(type rsc)
+(roletype object_r rsc)
+
+; rsc_exec — the binary at /vendor/bin/rsc
+(type rsc_exec)
+(roletype object_r rsc_exec)
+
+; rsc_data_file — /data/adb/rsc/ directory (config + logs)
+(type rsc_data_file)
+(roletype object_r rsc_data_file)
+
+; rsc_mtk_battery_proc — /proc/mtk_battery_cmd/* (cut-off control)
+(type rsc_mtk_battery_proc)
+(roletype object_r rsc_mtk_battery_proc)
+
+; =============================================================================
+; 2. Typeattribute membership — register new types with existing attributes
+; =============================================================================
+; Without these, the types are isolated and most neverallow checks won't
+; fire correctly. The attributes themselves are declared in
+; plat_pub_versioned.cil; we just add our types to them.
+
+; rsc is a domain (so it can be a process subject)
+(typeattributeset domain (rsc))
+
+; rsc_exec is a file_type (so it can be labeled on disk)
+(typeattributeset file_type (rsc_exec rsc_data_file rsc_mtk_battery_proc))
+
+; rsc_data_file is a data_file_type (so /data/adb/rsc/ behaves like data)
+(typeattributeset data_file_type (rsc_data_file))
+
+; rsc_exec is a vendor_file_type subclass — needed because /vendor/bin
+; files default to vendor_file_30_0. We declare it as exec_type so
+; type_transition works correctly.
+(typeattributeset exec_type (rsc_exec))
+
+; rsc_mtk_battery_proc is a proc type — needed for genfscon to apply
+(typeattributeset proc_type (rsc_mtk_battery_proc))
+
+; rsc is mlstrustedsubject — bypasses MLS restrictions so it can write
+; to /proc paths that are owned by system_server-adjacent levels.
+; This is the same approach used by aee_aedv, aee_hal, kisd,
+; loghidlvendorservice, mnld, modemdbfilter_service, thermalloadalgod,
+; md_monitor, mtk_hal_neuralnetworks (see vendor_sepolicy.cil line 410).
+(typeattributeset mlstrustedsubject (rsc))
+
+; =============================================================================
+; 3. Domain transition: init forks rsc_exec -> rsc
+; =============================================================================
+; Mirror the thermal_core pattern (vendor_sepolicy.cil lines 8233-8237).
+;
+; PRIMARY path (when vendor_file_contexts is also patched):
+;   Binary /vendor/bin/rsc is labeled rsc_exec -> type_transition fires
+;   automatically -> process enters rsc domain.
+;
+; FALLBACK path (when only vendor_sepolicy.cil is patched, binary stays
+;   labeled vendor_file_30_0 because file_contexts not applied/restorecon'd):
+;   init cannot exec vendor_file_30_0 by default (vendor_file is not
+;   exec_type). We grant explicit exec allow + a SECOND type_transition
+;   rule on vendor_file_30_0 so the .rc's `seclabel u:r:rsc:s0` can
+;   still drive the transition. This is more permissive than the primary
+;   path (any /vendor/bin/rsc-shaped file at this path transitions to
+;   rsc), but unblocks users who skipped the file_contexts step.
+;   See docs/ANALYSIS.md for why we still recommend patching both files.
+
+; Primary: transition via rsc_exec (clean isolation)
+(allow init_30_0 rsc (process (transition)))
+(dontaudit init_30_0 rsc (process (noatsecure)))
+(allow init_30_0 rsc (process (siginh rlimitinh)))
+(typetransition init_30_0 rsc_exec process rsc)
+
+; init needs to read/exec the binary to fork it (primary path)
+(allow init_30_0 rsc_exec (file (read getattr map execute open entrypoint)))
+
+; rsc can execute its own binary (for self-restart scenarios)
+(allow rsc rsc_exec (file (read getattr map execute open entrypoint)))
+
+; Fallback: allow init to exec vendor_file_30_0 at /vendor/bin/* paths.
+; Without this, init gets "avc: denied { execute } for ... tcontext=
+; u:object_r:vendor_file:s0" when binary label is not rsc_exec.
+; This is safe because init already has exec on most vendor binaries —
+; we're just making sure the specific transition to rsc domain works.
+(allow init_30_0 vendor_file_30_0 (file (read getattr map execute open entrypoint)))
+
+; Fallback: rsc can use vendor_file_30_0 as entrypoint.
+; CRITICAL — this rule is required for the seclabel fallback path.
+; When binary is labeled vendor_file (because file_contexts patch not
+; applied OR not restorecon'd), init still tries to transition to rsc
+; domain via seclabel. SELinux checks 'entrypoint' permission on the NEW
+; domain (rsc), not on init. Without this rule, the check fails with:
+;   avc: denied { entrypoint } for comm="init" path="/vendor/bin/rsc"
+;     scontext=u:r:rsc:s0 tcontext=u:object_r:vendor_file:s0
+; This is broader than ideal (any vendor_file-labeled binary could
+; become rsc's entrypoint), but unblocks the fallback path until
+; file_contexts patch is properly applied + restorecon'd.
+(allow rsc vendor_file_30_0 (file (entrypoint)))
+
+; Fallback: type_transition from vendor_file_30_0 to rsc domain.
+; This fires when `seclabel u:r:rsc:s0` is in the .rc file AND init
+; execs a vendor_file_30_0-labeled binary at the rsc service path.
+; Without this, even with seclabel set, the process stays in init domain
+; because there's no transition rule.
+(typetransition init_30_0 vendor_file_30_0 process rsc)
+
+; =============================================================================
+; 4. Read battery sysfs (capacity, status)
+; =============================================================================
+; /sys/class/power_supply/battery/capacity  — labeled sysfs_batteryinfo_30_0
+; /sys/class/power_supply/battery/status    — labeled sysfs_batteryinfo_30_0
+; (via genfscon sysfs /devices/platform/battery at line 345)
+
+(allow rsc sysfs_batteryinfo_30_0 (dir (search)))
+(allow rsc sysfs_batteryinfo_30_0 (file (read getattr open)))
+
+; Fallback: some MTK ROMs label /sys/class/power_supply/* as generic sysfs
+(allow rsc sysfs_30_0 (dir (search)))
+(allow rsc sysfs_30_0 (file (read getattr open)))
+
+; =============================================================================
+; 5. Write MTK battery_cmd procfs (cut-off / resume)
+; =============================================================================
+; /proc/mtk_battery_cmd/en_power_path
+; /proc/mtk_battery_cmd/current_cmd
+;
+; We add a genfscon rule below to label this subtree as rsc_mtk_battery_proc.
+; Then grant rsc write access to its own type.
+
+(genfscon proc /mtk_battery_cmd (u object_r rsc_mtk_battery_proc ((s0) (s0))))
+(genfscon proc /mtk_battery_cmd/en_power_path (u object_r rsc_mtk_battery_proc ((s0) (s0))))
+(genfscon proc /mtk_battery_cmd/current_cmd (u object_r rsc_mtk_battery_proc ((s0) (s0))))
+
+(allow rsc rsc_mtk_battery_proc (dir (search)))
+(allow rsc rsc_mtk_battery_proc (file (read write getattr open setattr)))
+
+; =============================================================================
+; 6. Write MTK battery thermal delimiter sysfs
+; =============================================================================
+; /sys/devices/platform/battery/disable_nafg     — labeled sysfs_batteryinfo_30_0
+; /sys/devices/platform/battery/ntc_disable_nafg — labeled sysfs_batteryinfo_30_0
+;
+; We allow write to sysfs_batteryinfo_30_0 (the existing type) instead of
+; creating a sub-type. This matches the pattern used by meta_tst and
+; factory (vendor_sepolicy.cil lines 5366-5368, 6253-6254).
+
+(allow rsc sysfs_batteryinfo_30_0 (file (write setattr)))
+
+; =============================================================================
+; 7. /data/adb/rsc/ — config + log directory
+; =============================================================================
+; /data/adb is labeled adb_data_file_30_0 by default. We declare our own
+; subdirectory type so rsc can write freely without weakening /data/adb
+; overall.
+
+(allow rsc rsc_data_file (dir (create read write getattr setattr search add_name remove_name rmdir open)))
+(allow rsc rsc_data_file (file (create read write getattr setattr append unlink rename open)))
+
+; Walk up to /data/adb/rsc from /data
+; CRITICAL: rsc needs write + add_name on adb_data_file to CREATE
+; /data/adb/rsc/ directory. Without this, FileLogger::new() silently
+; fails (EACCES on create_dir_all), daemon runs but produces NO log file.
+; This was the root cause of "/data/adb/rsc/ not found" on Infinix X695C.
+(allow rsc adb_data_file_30_0 (dir (search write add_name create)))
+
+; CRITICAL: When rsc creates /data/adb/rsc/ at runtime (before restorecon),
+; the new dir inherits parent label (adb_data_file:s0), NOT rsc_data_file:s0.
+; Without this rule, daemon can mkdir but can't create log file:
+;   avc: denied { create } for comm="rsc" name="rsc.log"
+;     tcontext=u:object_r:adb_data_file:s0 tclass=file
+(allow rsc adb_data_file_30_0 (file (create write open getattr append)))
+
+; Suppress denial for /sys/kernel/mm/ traversal (Rust stdlib traverses parent dirs)
+(dontaudit rsc sysfs_mm (dir (search)))
+(allow rsc system_data_file_30_0 (dir (search)))
+(allow rsc system_data_root_file_30_0 (dir (search)))
+
+; =============================================================================
+; 8. Signal handling (SIGTERM/SIGINT/SIGHUP from init)
+; =============================================================================
+; NOTE: SELinux process class does NOT have a `sigterm` permission.
+; SIGTERM is covered by the generic `signal` permission. Valid process
+; signal permissions are: sigchld, sigkill, sigstop, signull, signal.
+(allow init_30_0 rsc (process (signal sigkill)))
+(allow rsc self (process (signal setpgid setsched)))
+
+; =============================================================================
+; 9. Logging facilities (file-only, no logcat dependency per user choice)
+; =============================================================================
+; rsc writes to its own log file. We still allow /dev/null for stdio
+; redirection and /dev/kmsg for panic-level errors.
+
+(allow rsc null_device_30_0 (chr_file (read write open)))
+(allow rsc kmsg_device_30_0 (chr_file (write open)))
+(allow rsc ptmx_device_30_0 (chr_file (read write open getattr ioctl)))
+
+; =============================================================================
+; 9b. Netlink KOBJECT_UEVENT socket (v0.2.0+ uevent-driven mode)
+; =============================================================================
+; Required for the uevent-driven main loop. Without this, UeventListener::new()
+; fails with EACCES and the daemon falls back to polling mode automatically.
+;
+; Class `netlink_kobject_uevent_socket` is declared in the platform policy
+; (plat_pub_versioned.cil). We grant rsc the perms needed by Rust code:
+;   - create: socket() syscall
+;   - bind:   bind() to KOBJECT_UEVENT multicast group
+;   - read:   recv() uevent messages
+;   - setopt: setsockopt(SO_RCVTIMEO) for recv_timeout() — was MISSING,
+;             caused "avc: denied { setopt }" retries every 5 seconds.
+;             Without this, daemon loops forever retrying setsockopt with
+;             5s backoff (per main.rs error handler).
+
+(allow rsc self (netlink_kobject_uevent_socket (create bind read setopt)))
+
+; =============================================================================
+; 10. Capabilities
+; =============================================================================
+; rsc does NOT need any Linux capabilities beyond what `init` grants.
+; It only writes to sysfs/proc which is governed by DAC root + SELinux,
+; not by capabilities. We deliberately omit setuid/setgid/sys_admin etc.
+
+; =============================================================================
+; Notes on neverallow compliance
+; =============================================================================
+; The vendor_sepolicy.cil has 329 neverallow rules. Key ones that COULD
+; block us, and why they don't:
+;
+; 1. (neverallow base_typeattr_626_30_0 sysfs_30_0 (file (write ...)))
+;    This blocks writes to GENERIC sysfs_30_0. We avoid it by writing to
+;    sysfs_batteryinfo_30_0 (a DIFFERENT type), which is NOT covered by
+;    this neverallow.
+;
+; 2. (neverallow <some domain> proc (file (write ...)))
+;    We avoid this by labeling /proc/mtk_battery_cmd/* with our OWN type
+;    rsc_mtk_battery_proc, not generic proc.
+;
+; 3. mlstrustedsubject bypass — we added rsc to mlstrustedsubject
+;    (line 410-style). This bypasses MLS restrictions for cases where
+;    the proc/sysfs path is at a different MLS level. The trade-off is
+;    documented in vendor_sepolicy.cil — vendor daemons like aee_aedv,
+;    thermalloadalgod use the same approach.
+;
+; If you encounter "neverallow" violation at boot (visible in
+; `dmesg | grep selinux` or `logcat | grep avc`), uncomment the
+; mlstrustedsubject line above (already active by default) and verify
+; the boot completes. If it still fails, the neverallow is likely in
+; plat_pub_versioned.cil (2037 rules there) and requires editing that
+; file too — see troubleshooting section in README.md.

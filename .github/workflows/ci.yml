@@ -1,0 +1,113 @@
+# CI — lint, syntax check, and compile test for rsc
+#
+# Runs on every push to main and on every PR.
+# Verifies code quality and build readiness.
+# Does NOT upload any artifacts — release.yml handles distribution.
+#
+# Jobs:
+#   1. lint    — cargo fmt + clippy + check + test (native x86_64)
+#   2. compile — cross-compile to aarch64-linux-android (verify build)
+#   3. cil     — SELinux CIL policy syntax validation
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Lint + Test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ hashFiles('Cargo.toml') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Compile check
+        run: cargo check --all-targets
+
+      - name: Unit tests
+        run: cargo test --all-targets
+
+  compile:
+    name: Cross-compile (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ hashFiles('Cargo.toml') }}
+
+      - name: Configure cargo linker
+        run: |
+          mkdir -p .cargo
+          printf '[target.aarch64-linux-android]\nlinker = "%s"\n\n[build]\ntarget = "aarch64-linux-android"\n' \
+            "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            > .cargo/config.toml
+
+      - name: Build release
+        run: cargo build --release --target aarch64-linux-android
+
+      - name: Verify binary
+        run: |
+          file target/aarch64-linux-android/release/rsc
+          file target/aarch64-linux-android/release/rsc | grep -q "ARM aarch64"
+
+  cil:
+    name: SELinux CIL syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate CIL policy
+        run: python3 selinux/check_cil.py

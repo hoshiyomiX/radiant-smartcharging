@@ -1,0 +1,133 @@
+# Release — build aarch64 binary, assemble ZIP bundle, upload to GitHub Release
+#
+# Triggers ONLY on tag push matching v* (e.g. git push origin v0.1.0).
+# Does NOT run on regular commits — CI workflow handles that.
+#
+# ZIP bundle contains:
+#   rsc                    — aarch64 binary (stripped)
+#   rsc.rc                 — Android init service definition
+#   vendor_sepolicy.cil    — Pre-patched SELinux CIL policy
+#   vendor_file_contexts   — Pre-patched file_contexts
+#   config.example.toml    — Example config
+#   INSTALL.md             — Step-by-step installation guide
+#   README.md              — Project overview
+#   TROUBLESHOOTING.md     — Debugging guide
+#   LICENSE                — MIT
+#   rsc.sha256             — SHA256 checksum for binary
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build + Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ hashFiles('Cargo.toml') }}
+
+      - name: Configure cargo linker
+        run: |
+          mkdir -p .cargo
+          printf '[target.aarch64-linux-android]\nlinker = "%s"\n\n[build]\ntarget = "aarch64-linux-android"\n' \
+            "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            > .cargo/config.toml
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-linux-android
+
+      - name: Strip binary
+        run: |
+          "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            --strip-all target/aarch64-linux-android/release/rsc
+
+      - name: Verify binary
+        run: |
+          file target/aarch64-linux-android/release/rsc
+          file target/aarch64-linux-android/release/rsc | grep -q "ARM aarch64"
+
+      - name: Assemble ZIP bundle
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          DIR="rsc-v${VER}-bundle"
+          mkdir -p "$DIR"
+
+          cp target/aarch64-linux-android/release/rsc "$DIR/rsc"
+          cp android/rsc.rc "$DIR/rsc.rc"
+          cp selinux/vendor_sepolicy.cil.patched "$DIR/vendor_sepolicy.cil"
+          cp selinux/vendor_file_contexts.patched "$DIR/vendor_file_contexts"
+          cp config.example.toml "$DIR/config.example.toml"
+          cp INSTALL.md "$DIR/INSTALL.md"
+          cp README.md "$DIR/README.md"
+          cp LICENSE "$DIR/LICENSE"
+          cp docs/TROUBLESHOOTING.md "$DIR/TROUBLESHOOTING.md"
+
+          cd "$DIR" && sha256sum rsc > rsc.sha256 && cd ..
+
+          zip -r "rsc-v${VER}-bundle.zip" "$DIR"
+          sha256sum "rsc-v${VER}-bundle.zip" > "rsc-v${VER}-bundle.zip.sha256"
+
+          echo "=== ZIP contents ==="
+          unzip -l "rsc-v${VER}-bundle.zip"
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          awk -v ver="$VER" '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "[" ver "]") > 0) { in_section=1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > /tmp/release_notes.md
+
+          if [ ! -s /tmp/release_notes.md ]; then
+            git for-each-ref --format='%(contents:body)' "refs/tags/v${VER}" > /tmp/release_notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }} — RSC (Radiant Smart Charging)
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            rsc-v${{ steps.ver.outputs.version }}-bundle.zip
+            rsc-v${{ steps.ver.outputs.version }}-bundle.zip.sha256
+          fail_on_unmatched_files: true

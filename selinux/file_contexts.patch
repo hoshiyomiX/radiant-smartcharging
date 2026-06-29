@@ -1,0 +1,59 @@
+# rsc file_contexts patch — append to /vendor/etc/selinux/vendor_file_contexts
+#
+# These entries assign SELinux labels to rsc's on-disk paths. The CIL
+# policy (rsc.cil) declares the types; file_contexts maps paths to
+# those types.
+#
+# Format: <path regex> <whitespace> <selinux label>
+#
+# Apply: append this entire file to:
+#   /vendor/etc/selinux/vendor_file_contexts
+#
+# IMPORTANT: file_contexts is read ONCE at boot. After editing, you MUST
+# also delete the precompiled_sepolicy hash file so init knows to
+# recompile. See install.sh for the full procedure.
+
+# =============================================================================
+# Binary exec label — /vendor/bin/rsc
+# =============================================================================
+# Without this, /vendor/bin/rsc falls to the generic vendor_file_30_0
+# type, which prevents the type_transition(init, rsc_exec, rsc) rule
+# from firing — rsc would run in init's domain instead of its own.
+/vendor/bin/rsc    u:object_r:rsc_exec:s0
+
+# =============================================================================
+# Data directory + log file — /data/adb/rsc/*
+# =============================================================================
+# /data/adb defaults to adb_data_file_30_0 on stock Android. We declare
+# our own subdirectory type so rsc can write freely.
+#
+# The longest-prefix match rule means /data/adb/rsc/* matches this
+# entry, not the parent /data/adb entry.
+/data/adb/rsc(/.*)?    u:object_r:rsc_data_file:s0
+
+# =============================================================================
+# Init script — /vendor/etc/init/rsc.rc
+# =============================================================================
+# Vendor init scripts are loaded automatically from /vendor/etc/init/.
+# They are typically labeled vendor_configs_file by the parent directory
+# rule. No custom label needed here — the default is correct.
+
+# =============================================================================
+# /proc/mtk_battery_cmd/* — labeled via genfscon in rsc.cil, NOT here
+# =============================================================================
+# Note: genfscon rules (in CIL) label /proc and /sys paths at the kernel
+# filesystem level, NOT file_contexts. file_contexts is only for on-disk
+# files (ext4/f2fs). The genfscon rules in rsc.cil already cover:
+#   - /proc/mtk_battery_cmd
+#   - /proc/mtk_battery_cmd/en_power_path
+#   - /proc/mtk_battery_cmd/current_cmd
+# No file_contexts entry needed for proc paths.
+
+# =============================================================================
+# /sys/devices/platform/battery/* — ALREADY labeled in existing CIL
+# =============================================================================
+# vendor_sepolicy.cil line 345 already has:
+#   (genfscon sysfs /devices/platform/battery (u object_r sysfs_batteryinfo ((s0) (s0))))
+# This labels disable_nafg, ntc_disable_nafg, and everything else under
+# /sys/devices/platform/battery/ as sysfs_batteryinfo_30_0. We don't
+# need to relabel — rsc.cil grants write access to that existing type.

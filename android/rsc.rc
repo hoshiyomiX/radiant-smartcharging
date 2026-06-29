@@ -1,0 +1,78 @@
+# rsc — Android init service (vendor variant, MT Manager drop-in)
+#
+# Install at: /vendor/etc/init/rsc.rc  (or /system/etc/init/rsc.rc)
+# Binary at:  /vendor/bin/rsc           (or /system/bin/rsc)
+# Config at:  /data/adb/rsc/config.toml (optional — defaults used if missing)
+# Log at:     /data/adb/rsc/rsc.log
+# Last boot:  /data/adb/rsc/rsc-lastboot.log
+#
+# Class late_start keeps us off the critical boot path. /data is mounted
+# by the time late_start services launch, so config & log paths are
+# writable.
+#
+# seclabel u:r:rsc:s0 forces init to transition to rsc domain
+# regardless of the binary's file label. This is a fallback safety:
+#   - If vendor_file_contexts IS patched (rsc_exec label applied):
+#       type_transition(init, rsc_exec, rsc) fires automatically
+#       AND seclabel also requests rsc domain — they agree.
+#   - If vendor_file_contexts is NOT patched (binary stays vendor_file_30_0):
+#       type_transition would NOT fire (label mismatch)
+#       BUT seclabel forces the transition anyway — daemon still runs in
+#       rsc domain (as long as CIL allows init→rsc transition).
+#
+# This makes the .rc resilient: even if you only edit vendor_sepolicy.cil
+# (and skip file_contexts), the daemon still enters the rsc domain.
+#
+# ---------------------------------------------------------------------
+# rsc_cleanup oneshot service
+# ---------------------------------------------------------------------
+# The cleanup service runs ONCE at boot, BEFORE the main rsc daemon
+# starts. It does two things:
+#
+#   1. Restore MTK sysfs state to safe defaults:
+#        /sys/devices/platform/battery/disable_nafg     <- 0
+#        /sys/devices/platform/battery/ntc_disable_nafg <- 0
+#        /proc/mtk_battery_cmd/current_cmd              <- "0 0"
+#      This protects against the previous daemon instance being
+#      SIGKILLed (OOM, crash, reboot) and leaving the cut-off / thermal
+#      delimiter in an active state.
+#
+#   2. Rotate /data/adb/rsc/rsc.log -> rsc-lastboot.log (single file,
+#      overwrite if exists — only the MOST RECENT previous boot is
+#      kept). This gives the user the previous boot's log for
+#      comparison without filling up storage.
+#
+# `exec_start` (not `start`) is used because it BLOCKS the action block
+# until cleanup completes — guaranteeing the main `rsc` service does not
+# start until cleanup is done. Per AOSP system/core/init/README.md,
+# `exec_start` is "intended for must-have checks during boot."
+
+# --- Main daemon service ---
+service rsc /vendor/bin/rsc
+    class late_start
+    user root
+    group root system
+    seclabel u:r:rsc:s0
+    disabled
+
+# --- Cleanup oneshot (runs once at boot, before main daemon) ---
+service rsc_cleanup /vendor/bin/rsc --cleanup
+    class late_start
+    user root
+    group root system
+    seclabel u:r:rsc:s0
+    oneshot
+    disabled
+
+# --- Trigger cleanup + main daemon after boot completes ---
+#
+# `exec_start rsc_cleanup` blocks until cleanup exits, THEN `start rsc`
+# launches the main daemon. This is the only init-level ordering
+# guarantee that the cleanup completes before the daemon starts.
+on property:sys.boot_completed=1
+    exec_start rsc_cleanup
+    start rsc
+
+on boot
+    setprop persist.rsc.cutoff.default 80
+    setprop persist.rsc.resume.default 70

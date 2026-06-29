@@ -1,0 +1,25 @@
+[package]
+name = "rsc"
+version = "1.0.0"
+edition = "2021"
+authors = ["rsc daemon"]
+description = "Android MTK battery auto-cut & thermal delimiter init daemon"
+license = "MIT"
+
+[[bin]]
+name = "rsc"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+nix = { version = "0.27", default-features = false, features = ["signal", "process", "user"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

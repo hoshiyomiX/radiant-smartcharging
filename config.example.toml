@@ -1,0 +1,22 @@
+# rsc configuration
+# Place at: /data/adb/rsc/config.toml
+# If missing, defaults are used. Partial config supported — only specify
+# fields you want to override.
+
+# --- Auto-cut charging ---
+cutoff = 80
+resume = 70
+
+# --- Debuggability ---
+# debug = true enables verbose per-tick logging (every uevent, every
+# sysfs read/write). Default false — daemon is silent except on state
+# changes.
+debug = false
+
+# --- Logging ---
+log_file = "/data/adb/rsc/rsc.log"
+log_max_size_kb = 512
+log_keep = 3
+
+# Log timestamps are in GMT+8 (Asia/Makassar / WITA).
+# Previous-boot log is saved as rsc-lastboot.log by --cleanup at boot.
