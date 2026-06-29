@@ -6,6 +6,21 @@
 //!
 //! The `status` field is one of: Charging, Discharging, Full, Not charging,
 //! or Unknown. We map it to a small enum for clarity.
+//!
+//! ## Status semantics on MTK devices
+//!
+//! - `Charging` — battery is actively receiving current.
+//! - `Discharging` — battery is providing current to the device (charger
+//!   unplugged, or charger plugged but charging path cut off).
+//! - `Not charging` — MTK bypass charging mode: device runs directly on
+//!   charger power with low input current, battery is idle. Battery
+//!   level stays stable (does NOT drop). This is the state after rsc
+//!   applies cutoff — the device keeps running on charger power while
+//!   the battery is disconnected from the charging path.
+//! - `Full` — battery is at 100% and charger is plugged. MTK has
+//!   already cut off the charging path internally.
+//! - `Unknown` — driver could not determine state (rare, usually
+//!   indicates a fuel-gauge communication error).
 
 use std::fs;
 use std::io::Read;
@@ -26,7 +41,9 @@ impl ChargeState {
     /// True when an external power source is actively pushing current into
     /// the battery. `Full` is excluded because once the battery is full,
     /// MTK has already cut off the path and re-applying the cut command is
-    /// a no-op but a delimiter toggle would be wasteful.
+    /// a no-op but a delimiter toggle would be wasteful. `NotCharging` is
+    /// excluded because in MTK bypass charging mode the battery is idle
+    /// (not receiving current), even though the charger is plugged in.
     pub fn is_charging(&self) -> bool {
         matches!(self, ChargeState::Charging)
     }

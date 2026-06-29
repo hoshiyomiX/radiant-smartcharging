@@ -186,44 +186,28 @@ struct Daemon {
     boot_id: String,
     /// Runtime stats counters.
     stats: Stats,
-    /// Post-resume health check state.
-    /// When a resume is applied, we record cap_at_resume + time_of_resume.
-    /// On each subsequent tick for up to 10 minutes, we compare cap
-    /// trajectory to detect silent resume failure (FET stuck off
-    /// despite sysfs reporting Charging).
-    resume_health: Option<ResumeHealth>,
+    /// Timestamp of the last charging-status transition (true→false or
+    /// false→true). Used by the kernel-flip debounce: if a new transition
+    /// happens within `CHARGE_FLIP_DEBOUNCE_MS` of the previous one, the
+    /// thermal delimiter toggle is suppressed (the daemon assumes it's a
+    /// spurious kernel state flip, not a real plug/unplug event).
+    /// See docs/KERNEL_FLIP_DEBUG.md for root-cause debugging guide.
+    last_charge_flip: Option<Instant>,
 }
 
-/// Post-resume health check tracker.
+/// Debounce window for charging-status transitions. If two consecutive
+/// `charging` flips (true→false→true OR false→true→false) happen within
+/// this window, the second flip is treated as a kernel glitch and the
+/// thermal delimiter toggle is suppressed.
 ///
-/// After `resume_charging()` succeeds, the daemon records the cap and
-/// timestamp. On each subsequent tick, it checks:
+/// 2 seconds is chosen because:
+///   - Real user plug/unplug takes at least 5-10 seconds (cable
+///     manipulation is physically slow).
+///   - USB PD renegotiation flips happen in <1 second.
+///   - MTK driver fuel-gauge jitter happens in <500ms.
 ///
-///   - Within 5 min: if cap drops 2+% below resume_cap → WARN
-///     (result=degrading). This is the silent-failure signature —
-///     cap went 80→56 in 2h38min after "successful"
-///     resume, because `current_cmd=0 0` wrote OK but the FET stayed
-///     off.
-///
-///   - At 5 min: if cap has risen 1+% → INFO (result=confirmed), clear
-///     tracker. Resume was successful.
-///
-///   - At 10 min: if cap is still flat or dropping → ERROR
-///     (result=failed), clear tracker, suggest manual intervention.
-///     User may need to physically replug the charger.
-#[derive(Debug, Clone, Copy)]
-struct ResumeHealth {
-    /// Capacity (%) at the moment resume was applied.
-    cap_at_resume: u8,
-    /// Timestamp when resume was applied.
-    time: Instant,
-}
-
-/// Thresholds for the post-resume health check.
-const RESUME_HEALTH_WARN_DROP_PCT: u8 = 2;
-const RESUME_HEALTH_CONFIRM_RISE_PCT: u8 = 1;
-const RESUME_HEALTH_CONFIRM_WINDOW: Duration = Duration::from_secs(5 * 60);
-const RESUME_HEALTH_FAIL_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Set to `Duration::ZERO` to disable debounce entirely.
+const CHARGE_FLIP_DEBOUNCE: Duration = Duration::from_millis(2000);
 
 impl Daemon {
     fn new(cfg: config::Config) -> Self {
@@ -239,7 +223,7 @@ impl Daemon {
             last_state: None,
             boot_id,
             stats: Stats::new(),
-            resume_health: None,
+            last_charge_flip: None,
         }
     }
 
@@ -248,9 +232,9 @@ impl Daemon {
     /// This is the event-driven replacement for the periodic stats dump.
     /// Instead of waking the daemon every N seconds to dump stats, we
     /// append the current stats counters to significant event log lines
-    /// (cutoff, resume, thermal toggle, health check verdicts, shutdown).
-    /// This gives the same diagnostic visibility with ZERO interval-based
-    /// logic — the daemon stays 100% pure-uevent-driven.
+    /// (cutoff, resume, thermal toggle, shutdown). This gives the same
+    /// diagnostic visibility with ZERO interval-based logic — the daemon
+    /// stays 100% pure-uevent-driven.
     ///
     /// The emitted line looks like:
     ///   [ts INFO seq=N] <msg> event=<event_type> <extra_kv...> boot_id=xxx ticks=N events_recv=N ...
@@ -506,65 +490,113 @@ impl Daemon {
         }
 
         // --- Thermal delimiter: ON while charging, OFF otherwise ---
+        //
+        // Kernel-flip debounce (v1.0.1+): if the charging status just
+        // flipped within `CHARGE_FLIP_DEBOUNCE` (2s), suppress the
+        // thermal toggle — this is almost certainly a spurious kernel
+        // state flip (USB PD renegotiation, MTK driver fuel-gauge
+        // jitter), not a real plug/unplug event. Real user plug/unplug
+        // takes at least 5-10 seconds.
+        //
+        // See docs/KERNEL_FLIP_DEBUG.md for root-cause debugging guide.
+        let now = Instant::now();
+        let mut suppress_thermal_toggle = false;
+        if let Some(last_flip) = self.last_charge_flip {
+            let elapsed_since_flip = now.duration_since(last_flip);
+            if elapsed_since_flip < CHARGE_FLIP_DEBOUNCE {
+                suppress_thermal_toggle = true;
+                self.log.log_kv(
+                    "DEBUG",
+                    "charge flip debounce: suppressing thermal toggle",
+                    &[
+                        ("event", "charge_flip_suppressed"),
+                        ("elapsed_ms", &elapsed_since_flip.as_millis().to_string()),
+                        (
+                            "threshold_ms",
+                            &CHARGE_FLIP_DEBOUNCE.as_millis().to_string(),
+                        ),
+                    ],
+                );
+            }
+        }
+
         if charging && !self.thermal_on {
-            self.log.debug_if_kv(
-                self.cfg.debug,
-                "enabling thermal delimiter",
-                &[("event", "thermal")],
-            );
-            match mtk::enable_thermal_delimiter() {
-                Ok(_) => {
-                    self.thermal_on = true;
-                    self.stats.thermal_toggles.fetch_add(1, Ordering::Relaxed);
-                    self.log_event_with_stats(
-                        "INFO",
-                        "thermal delimiter ENABLED",
-                        "thermal",
-                        &[("reason", "charging_detected")],
-                    );
-                }
-                Err(e) => {
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    self.log.log_kv(
-                        "WARN",
-                        "enable thermal failed",
-                        &[("event", "warn"), ("err", &e.to_string())],
-                    );
+            if suppress_thermal_toggle {
+                // Kernel flip detected — leave thermal_on as-is (false).
+                // The next real charging event will toggle it on.
+            } else {
+                self.log.debug_if_kv(
+                    self.cfg.debug,
+                    "enabling thermal delimiter",
+                    &[("event", "thermal")],
+                );
+                match mtk::enable_thermal_delimiter() {
+                    Ok(_) => {
+                        self.thermal_on = true;
+                        self.stats.thermal_toggles.fetch_add(1, Ordering::Relaxed);
+                        self.log_event_with_stats(
+                            "INFO",
+                            "thermal delimiter ENABLED",
+                            "thermal",
+                            &[("reason", "charging_detected")],
+                        );
+                    }
+                    Err(e) => {
+                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                        self.log.log_kv(
+                            "WARN",
+                            "enable thermal failed",
+                            &[("event", "warn"), ("err", &e.to_string())],
+                        );
+                    }
                 }
             }
         } else if !charging && self.thermal_on {
-            self.log.debug_if_kv(
-                self.cfg.debug,
-                "disabling thermal delimiter",
-                &[("event", "thermal")],
-            );
-            match mtk::disable_thermal_delimiter() {
-                Ok(_) => {
-                    self.thermal_on = false;
-                    self.stats.thermal_toggles.fetch_add(1, Ordering::Relaxed);
-                    // After cutoff, charging=false but charger may still be
-                    // plugged in. Use accurate reason instead of "unplugged".
-                    let reason = if self.cut == CutState::CutOff {
-                        "charging_cut_off"
-                    } else {
-                        "charger_unplugged"
-                    };
-                    self.log_event_with_stats(
-                        "INFO",
-                        "thermal delimiter DISABLED",
-                        "thermal",
-                        &[("reason", reason)],
-                    );
-                }
-                Err(e) => {
-                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                    self.log.log_kv(
-                        "WARN",
-                        "disable thermal failed",
-                        &[("event", "warn"), ("err", &e.to_string())],
-                    );
+            if suppress_thermal_toggle {
+                // Kernel flip detected — leave thermal_on as-is (true).
+                // The next real unplug event will toggle it off.
+            } else {
+                self.log.debug_if_kv(
+                    self.cfg.debug,
+                    "disabling thermal delimiter",
+                    &[("event", "thermal")],
+                );
+                match mtk::disable_thermal_delimiter() {
+                    Ok(_) => {
+                        self.thermal_on = false;
+                        self.stats.thermal_toggles.fetch_add(1, Ordering::Relaxed);
+                        // After cutoff, charging=false but charger may still be
+                        // plugged in. Use accurate reason instead of "unplugged".
+                        let reason = if self.cut == CutState::CutOff {
+                            "charging_cut_off"
+                        } else {
+                            "charger_unplugged"
+                        };
+                        self.log_event_with_stats(
+                            "INFO",
+                            "thermal delimiter DISABLED",
+                            "thermal",
+                            &[("reason", reason)],
+                        );
+                    }
+                    Err(e) => {
+                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                        self.log.log_kv(
+                            "WARN",
+                            "disable thermal failed",
+                            &[("event", "warn"), ("err", &e.to_string())],
+                        );
+                    }
                 }
             }
+        }
+
+        // Track this charging-status transition for the next tick's
+        // debounce check. We record the flip regardless of whether the
+        // thermal toggle was suppressed — the goal is to detect
+        // rapid back-to-back transitions, not to track thermal state.
+        if self.last_state.is_some() && self.last_state.unwrap().is_charging() != charging {
+            self.last_charge_flip = Some(now);
         }
 
         // --- Auto-cut with hysteresis ---
@@ -574,10 +606,12 @@ impl Daemon {
         // status (after cut-off, status is NotCharging/Discharging — expected).
         //
         // NOTE: No top-up cycle. Pure uevent-driven — daemon only wakes on
-        // kernel uevents. After cut-off, battery stays at cutoff level while
-        // charger is plugged in (MTK cut-off makes device run on charger power).
-        // Battery will resume charging naturally when it drops to resume
-        // threshold (uevent fires on capacity change).
+        // kernel uevents. After cut-off, the device enters MTK bypass
+        // charging mode (status=NotCharging): device runs directly on
+        // charger power with low input current, battery is idle, and
+        // battery level stays stable. Battery will resume charging
+        // naturally when it drops to resume threshold (uevent fires on
+        // capacity change).
 
         if charging && self.cut == CutState::Charging && cap >= self.cfg.cutoff {
             self.log.log_kv(
@@ -610,20 +644,16 @@ impl Daemon {
                 }
             }
         } else if self.cut == CutState::CutOff && cap <= self.cfg.resume {
-            // --- Resume charging (primary + fallback strategy) ---
+            // --- Resume charging (single-strategy) ---
             //
-            // The naive resume sequence (en_power_path=1 + current_cmd=0 0)
-            // silently failed on Infinix X695C: sysfs write succeeded but
-            // hardware FET stayed off, causing battery to keep draining
-            // despite kernel reporting POWER_SUPPLY_STATUS=Charging.
+            // The resume sequence uses reset+re-apply: en_power_path=0
+            // (force driver FSM reset) → sleep 50ms → en_power_path=1
+            // (re-enable power path) → sleep 50ms → current_cmd=0 0
+            // (clear cut flag). This is more robust than the naive
+            // `en_power_path=1 + current_cmd=0 0` sequence which can
+            // silently fail on some MTK BSP revisions.
             //
-            // Strategy:
-            //   1. Try primary sequence (reset+re-apply en_power_path).
-            //   2. Verify sysfs readback shows current_cmd=0 0.
-            //   3. If verification fails, try fallback toggle sequence.
-            //   4. Either way, set up post-resume health check that
-            //      monitors cap trajectory for 5-10 minutes to detect
-            //      the silent failure mode (FET stuck off).
+            // See src/mtk.rs::resume_charging() for the implementation.
             self.log.log_kv(
                 "INFO",
                 "RESUMING charging",
@@ -634,259 +664,30 @@ impl Daemon {
                 ],
             );
 
-            let mut applied = false;
-            let mut strategy_used = "none";
-
-            // Strategy A: primary reset+re-apply sequence.
             match mtk::resume_charging() {
                 Ok(_) => {
-                    // Verify sysfs readback.
-                    match mtk::verify_resume_applied() {
-                        Ok(true) => {
-                            applied = true;
-                            strategy_used = "primary";
-                        }
-                        Ok(false) => {
-                            // Sysfs readback mismatch — try fallback.
-                            self.log.log_kv(
-                                "WARN",
-                                "resume primary strategy: sysfs readback mismatch",
-                                &[
-                                    ("event", "resume"),
-                                    ("strategy", "primary"),
-                                    ("verified", "false"),
-                                    ("fallback", "trying_toggle"),
-                                ],
-                            );
-                        }
-                        Err(e) => {
-                            self.log.log_kv(
-                                "WARN",
-                                "resume primary strategy: verify failed",
-                                &[
-                                    ("event", "resume"),
-                                    ("strategy", "primary"),
-                                    ("err", &e.to_string()),
-                                    ("fallback", "trying_toggle"),
-                                ],
-                            );
-                        }
-                    }
+                    self.cut = CutState::Charging;
+                    self.stats.resume_events.fetch_add(1, Ordering::Relaxed);
+                    self.log_event_with_stats(
+                        "INFO",
+                        "resume applied",
+                        "resume",
+                        &[("result", "ok")],
+                    );
                 }
                 Err(e) => {
-                    self.log.log_kv(
-                        "WARN",
-                        "resume primary strategy failed",
-                        &[
-                            ("event", "resume"),
-                            ("strategy", "primary"),
-                            ("err", &e.to_string()),
-                            ("fallback", "trying_toggle"),
-                        ],
-                    );
-                }
-            }
-
-            // Strategy B: fallback toggle sequence (only if A didn't verify).
-            if !applied {
-                match mtk::resume_charging_with_toggle() {
-                    Ok(_) => match mtk::verify_resume_applied() {
-                        Ok(true) => {
-                            applied = true;
-                            strategy_used = "toggle";
-                        }
-                        Ok(false) => {
-                            self.log.log_kv(
-                                "ERROR",
-                                "resume toggle strategy: sysfs readback mismatch",
-                                &[
-                                    ("event", "resume"),
-                                    ("strategy", "toggle"),
-                                    ("verified", "false"),
-                                ],
-                            );
-                        }
-                        Err(e) => {
-                            self.log.log_kv(
-                                "ERROR",
-                                "resume toggle strategy: verify failed",
-                                &[
-                                    ("event", "resume"),
-                                    ("strategy", "toggle"),
-                                    ("err", &e.to_string()),
-                                ],
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        self.log.log_kv(
-                            "ERROR",
-                            "resume toggle strategy failed",
-                            &[
-                                ("event", "resume"),
-                                ("strategy", "toggle"),
-                                ("err", &e.to_string()),
-                            ],
-                        );
-                    }
-                }
-            }
-
-            if applied {
-                self.cut = CutState::Charging;
-                self.stats.resume_events.fetch_add(1, Ordering::Relaxed);
-                self.log_event_with_stats(
-                    "INFO",
-                    "resume applied",
-                    "resume",
-                    &[
-                        ("result", "ok"),
-                        ("strategy", strategy_used),
-                        ("verified", "true"),
-                    ],
-                );
-                // Arm the post-resume health check — monitor cap
-                // trajectory for the next 5-10 minutes to detect the
-                // silent failure mode (FET stuck off).
-                self.resume_health = Some(ResumeHealth {
-                    cap_at_resume: cap,
-                    time: Instant::now(),
-                });
-                self.log.log_kv(
-                    "INFO",
-                    "resume health check armed",
-                    &[
-                        ("event", "resume_health"),
-                        ("phase", "armed"),
-                        ("cap_at_resume", &format!("{}%", cap)),
-                        (
-                            "warn_drop_threshold",
-                            &format!("{}%", RESUME_HEALTH_WARN_DROP_PCT),
-                        ),
-                        (
-                            "confirm_window_secs",
-                            &RESUME_HEALTH_CONFIRM_WINDOW.as_secs().to_string(),
-                        ),
-                        (
-                            "fail_window_secs",
-                            &RESUME_HEALTH_FAIL_WINDOW.as_secs().to_string(),
-                        ),
-                    ],
-                );
-            } else {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                self.log.log_kv(
-                    "ERROR",
-                    "resume failed — all strategies exhausted",
-                    &[
-                        ("event", "resume"),
-                        ("result", "failed"),
-                        ("hint", "manual charger replug may be required"),
-                    ],
-                );
-                // Leave cut=CutOff so we retry on next tick. The
-                // post-resume health check is NOT armed.
-            }
-        }
-
-        // --- Post-resume health check ---
-        //
-        // If we recently applied a resume, monitor cap trajectory to
-        // detect the silent failure mode where sysfs reports Charging
-        // but the FET is actually still off (battery keeps draining).
-        // See ResumeHealth struct docs for the full state machine.
-        if let Some(rh) = self.resume_health {
-            let elapsed = rh.time.elapsed();
-            let cap_delta = cap as i16 - rh.cap_at_resume as i16;
-
-            if elapsed >= RESUME_HEALTH_FAIL_WINDOW {
-                // 10-minute window expired — make final verdict.
-                if cap_delta < RESUME_HEALTH_CONFIRM_RISE_PCT as i16 {
-                    // Cap didn't rise enough — silent failure.
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     self.log.log_kv(
                         "ERROR",
-                        "resume health check FAILED — cap not rising",
+                        "resume failed",
                         &[
-                            ("event", "resume_health"),
+                            ("event", "resume"),
                             ("result", "failed"),
-                            ("cap_at_resume", &format!("{}%", rh.cap_at_resume)),
-                            ("cap_now", &format!("{}%", cap)),
-                            ("delta", &format!("{}%", cap_delta)),
-                            ("elapsed_secs", &elapsed.as_secs().to_string()),
-                            (
-                                "hint",
-                                "FET likely stuck off — manual charger replug required",
-                            ),
+                            ("err", &e.to_string()),
+                            ("hint", "will retry on next tick"),
                         ],
                     );
-                } else {
-                    // Cap rose eventually — late confirmation.
-                    self.log.log_kv(
-                        "INFO",
-                        "resume health check confirmed (late)",
-                        &[
-                            ("event", "resume_health"),
-                            ("result", "confirmed_late"),
-                            ("cap_at_resume", &format!("{}%", rh.cap_at_resume)),
-                            ("cap_now", &format!("{}%", cap)),
-                            ("delta", &format!("{}%", cap_delta)),
-                            ("elapsed_secs", &elapsed.as_secs().to_string()),
-                        ],
-                    );
-                }
-                self.resume_health = None;
-            } else if elapsed >= RESUME_HEALTH_CONFIRM_WINDOW {
-                // 5-minute window — check for confirmation.
-                if cap_delta >= RESUME_HEALTH_CONFIRM_RISE_PCT as i16 {
-                    // Cap rose 1+% — resume confirmed successful.
-                    self.log.log_kv(
-                        "INFO",
-                        "resume health check confirmed",
-                        &[
-                            ("event", "resume_health"),
-                            ("result", "confirmed"),
-                            ("cap_at_resume", &format!("{}%", rh.cap_at_resume)),
-                            ("cap_now", &format!("{}%", cap)),
-                            ("delta", &format!("{}%", cap_delta)),
-                            ("elapsed_secs", &elapsed.as_secs().to_string()),
-                        ],
-                    );
-                    self.resume_health = None;
-                } else if cap_delta <= -(RESUME_HEALTH_WARN_DROP_PCT as i16) {
-                    // Cap dropped 2+% — silent failure signature.
-                    self.log.log_kv(
-                        "WARN",
-                        "resume health check DEGRADING — cap dropping despite charging=true",
-                        &[
-                            ("event", "resume_health"),
-                            ("result", "degrading"),
-                            ("cap_at_resume", &format!("{}%", rh.cap_at_resume)),
-                            ("cap_now", &format!("{}%", cap)),
-                            ("delta", &format!("{}%", cap_delta)),
-                            ("elapsed_secs", &elapsed.as_secs().to_string()),
-                            (
-                                "hint",
-                                "FET may be stuck off — will keep monitoring until 10min window",
-                            ),
-                        ],
-                    );
-                }
-                // else: cap flat — keep monitoring until 10min window.
-            } else {
-                // Within first 5 minutes — only warn on significant drop.
-                if cap_delta <= -(RESUME_HEALTH_WARN_DROP_PCT as i16) {
-                    self.log.log_kv(
-                        "WARN",
-                        "resume health check DEGRADING — cap dropping early",
-                        &[
-                            ("event", "resume_health"),
-                            ("result", "degrading_early"),
-                            ("cap_at_resume", &format!("{}%", rh.cap_at_resume)),
-                            ("cap_now", &format!("{}%", cap)),
-                            ("delta", &format!("{}%", cap_delta)),
-                            ("elapsed_secs", &elapsed.as_secs().to_string()),
-                        ],
-                    );
+                    // Leave cut=CutOff so we retry on next tick.
                 }
             }
         }

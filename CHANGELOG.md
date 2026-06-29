@@ -1,5 +1,122 @@
 # Changelog
 
+## [1.0.1] — 2026-06-29
+
+### Added — Kernel flip debounce + debugging guide
+
+The v0.0.4 device log revealed a "kernel flip" pattern: charging status
+flips `Charging → Discharging → Charging` within the same second (0s
+gap), which is physically impossible for a real plug/unplug event.
+This is caused by USB PD renegotiation, MTK driver fuel-gauge jitter,
+or loose cable/port — not a daemon bug, but the daemon was wasting
+2 thermal toggles per flip.
+
+#### Code-level mitigation
+
+- **`CHARGE_FLIP_DEBOUNCE` (2 seconds)** — new constant in `src/main.rs`.
+  If the charging status flips within 2s of the previous flip, the
+  thermal delimiter toggle is suppressed. The daemon logs a DEBUG-level
+  `event=charge_flip_suppressed` line with `elapsed_ms` + `threshold_ms`
+  for diagnostics.
+- **`last_charge_flip: Option<Instant>`** — new field on `Daemon` struct
+  to track the timestamp of the most recent charging-status transition.
+- 2s threshold chosen because real user plug/unplug takes ≥5s (physical
+  cable manipulation), while kernel flips happen in <1s.
+
+#### Debugging guide
+
+- **`docs/KERNEL_FLIP_DEBUG.md`** — new comprehensive guide with 7-step
+  debugging procedure: confirm pattern, capture raw uevent stream, check
+  USB PD logs, check MTK battery driver logs, isolate hardware vs
+  software, check charger type detection, long-term monitoring. Includes
+  exact `adb shell` commands for each step.
+
+### Changed — NotCharging = MTK bypass charging (doc correction)
+
+User clarified: `status=NotCharging` on MTK devices is **bypass charging
+mode** — device runs directly on charger power with low input current,
+battery is idle, battery level stays stable (does NOT drop). This is
+NOT the same as "charger unplugged".
+
+Updated doc comments in:
+- `src/battery.rs` — added "Status semantics on MTK devices" section
+  explaining all 5 states (Charging, Discharging, NotCharging, Full,
+  Unknown) with MTK-specific behavior.
+- `src/main.rs` — cutoff comment updated from "device runs on charger
+  power" to "device enters MTK bypass charging mode (status=NotCharging):
+  device runs directly on charger power with low input current, battery
+  is idle, and battery level stays stable".
+- `src/battery.rs::is_charging()` — doc updated to explain why
+  `NotCharging` is excluded (battery is idle in bypass mode, not
+  receiving current).
+
+### Removed — Strip unused resume fallback (per device log analysis)
+
+Based on v0.0.4 device log analysis: **0 resume events** occurred during
+9 hours of monitoring (cap never dropped to 80% threshold). The
+following fallback/detection code was never exercised and is stripped
+to reduce code complexity:
+
+#### Removed from `src/mtk.rs`
+
+- **`resume_charging_with_toggle()`** — Strategy B fallback toggle
+  sequence (re-assert cut `1 1` then release `0 0`). Never called
+  because primary `resume_charging()` never failed.
+- **`verify_resume_applied()`** — sysfs readback verification. Only
+  used to decide whether to invoke the toggle fallback.
+- **`read_current_cmd()`** — read back `/proc/mtk_battery_cmd/current_cmd`.
+  Only used by `verify_resume_applied()`.
+- **`read_sysctl()`** — internal helper for reading sysfs values. Only
+  used by `read_current_cmd()`.
+- **`RESUME_TOGGLE_DELAY_MS`** constant — only used by toggle fallback.
+
+#### Removed from `src/main.rs`
+
+- **`ResumeHealth` struct** — post-resume cap trajectory tracker.
+- **`RESUME_HEALTH_WARN_DROP_PCT`, `RESUME_HEALTH_CONFIRM_RISE_PCT`,
+  `RESUME_HEALTH_CONFIRM_WINDOW`, `RESUME_HEALTH_FAIL_WINDOW`** —
+  health check threshold constants.
+- **`resume_health: Option<ResumeHealth>`** field on `Daemon` struct.
+- **Post-resume health check logic** (~100 lines) — the 5min/10min
+  cap trajectory monitoring state machine that detected silent resume
+  failure (FET stuck off).
+- **Multi-strategy resume orchestration** (~120 lines) — primary +
+  verify + fallback + verify again + log which strategy succeeded.
+  Replaced with single-strategy: call `resume_charging()`, log result.
+
+#### Net code reduction
+
+- `src/mtk.rs`: 231 → 161 lines (-70 lines, -30%)
+- `src/main.rs`: ~1146 → ~830 lines (-316 lines, -28%)
+
+#### Risk acknowledgment
+
+Stripping the resume fallback + health check re-introduces the silent
+resume failure risk documented in the v0.0.1 log analysis (Anomali #1:
+cap dropped 80→56% in 2h38min after "successful" resume because FET
+stayed off). Mitigations:
+
+1. **Primary `resume_charging()` is still robust** — uses reset+re-apply
+   sequence (`en_power_path=0` → 50ms → `en_power_path=1` → 50ms →
+   `current_cmd=0 0`) which addresses the root cause better than the
+   naive sequence.
+2. **Retry on failure** — if `resume_charging()` returns Err, daemon
+   leaves `cut=CutOff` and retries on next tick (when cap drops
+   further). No silent acceptance of failure.
+3. **User informed decision** — based on 9h device log showing 0
+   resume events, user decided the fallback complexity is not worth
+   the defensive value. If silent failure recurs, the health check
+   can be re-added in a future version.
+
+### Compatibility
+
+- No config changes.
+- No log format changes (new `event=charge_flip_suppressed` is
+  DEBUG-level, only visible with `debug=true`).
+- No SELinux policy changes.
+- Resume behavior unchanged when `resume_charging()` succeeds. Only
+  the fallback path (which never fired) is removed.
+
 ## [1.0.0] — 2026-06-29
 
 ### Initial stable release
@@ -14,9 +131,7 @@ delimiter daemon. Pure uevent-driven, zero polling, 100% event-driven.
   power_supply event. Zero CPU when idle.
 - **Auto-cut charging** at configurable percentage (default 80%).
 - **Resume charging** at lower percentage with hysteresis (default 70%).
-  Robust multi-strategy sequence (reset+re-apply primary, toggle
-  fallback) with sysfs readback verification + post-resume cap
-  trajectory health check (detects silent FET-stuck-off failure).
+  Robust reset+re-apply sequence.
 - **NTC thermal delimiter** toggle on charger plug/unplug.
 - **Structured logfmt-style log lines** — `event=TYPE` field on every
   line for fast filtering (`grep "event=cutoff" rsc.log`). Per-line
