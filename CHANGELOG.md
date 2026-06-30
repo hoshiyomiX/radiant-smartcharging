@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.0.2] — 2026-06-29
+
+### Changed — Use device local timezone (not hardcoded WITA)
+
+Previous versions hardcoded GMT+8 (Asia/Makassar / WITA) timezone for
+all log timestamps. This was a developer-specific choice — it doesn't
+work for users in other timezones (WIB GMT+7, WIT GMT+9, or non-Indonesia
+users).
+
+v1.0.2 switches to `chrono::Local`, which reads the device's system
+timezone from `/etc/localtime` or `TZ` environment variable. The daemon
+now adapts to whatever timezone the Android device is configured to use.
+
+#### What changed
+
+- **`src/logger.rs`**: replaced `chrono::{FixedOffset, Utc}` import with
+  `chrono::Local`. Removed `WITA_OFFSET_SECS` constant + `wita_tz()`
+  helper function.
+- **`log_kv()`**: replaced `Utc::now().with_timezone(&wita_tz())` with
+  `Local::now()`. Same format string `%Y-%m-%dT%H:%M:%S%:z` produces the
+  same ISO 8601 with offset suffix (e.g. `+08:00`, `+07:00`, `-05:00`).
+- **Doc comments + README + INSTALL + config.example.toml**: updated to
+  say "device's local timezone" instead of "GMT+8 WITA".
+
+#### Behavior
+
+- On a device configured for Asia/Makassar (WITA): timestamps will be
+  `+08:00` (same as before).
+- On a device configured for Asia/Jakarta (WIB): timestamps will be
+  `+07:00`.
+- On a device configured for America/New_York: timestamps will be
+  `-05:00` (EST) or `-04:00` (EDT during DST).
+- On a device with no timezone config: defaults to UTC (`+00:00`).
+
+The UTC offset suffix is always included in the log, so the timezone is
+unambiguous regardless of device locale — no mental conversion needed
+when reading logs from devices in different timezones.
+
+#### Compatibility
+
+- No config changes.
+- No breaking changes to log format (still ISO 8601 with offset suffix).
+- No SELinux policy changes.
+- Existing log analysis scripts using `grep` patterns on timestamps
+  still work (the offset suffix is at the end of the timestamp, after
+  the seconds field).
+
 ## [1.0.1] — 2026-06-29
 
 ### Added — Kernel flip debounce + debugging guide

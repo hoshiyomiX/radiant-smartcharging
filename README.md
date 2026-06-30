@@ -25,8 +25,9 @@ state via **netlink uevents** (pure event-driven, zero polling) and:
 - **Debuggable**: `debug = true` in config enables verbose logging. Stats
   are logged event-driven (on cutoff/resume/thermal events + shutdown)
   — zero polling overhead.
-- **GMT+8 (WITA) timestamps**: All log lines use Asia/Makassar timezone
-  for easy reading without mental UTC conversion.
+- **Local device timestamps**: All log lines use the device's local
+  timezone (whatever Android is configured to use via `/etc/localtime`
+  or `TZ` env var). UTC offset suffix included for unambiguous reading.
 - **Tight SELinux confinement**: Custom `rsc` domain with dedicated types
   (`rsc_exec`, `rsc_data_file`, `rsc_mtk_battery_proc`).
 - **Small footprint**: ~480 KB stripped binary, only deps: libc + libdl.
@@ -97,8 +98,9 @@ specify only the fields you want to override.
 | `log_max_size_kb` | `512` | Max log size before rotation |
 | `log_keep` | `3` | Number of rotated logs to keep |
 
-Log timestamps are in GMT+8 (Asia/Makassar / WITA). Previous-boot log
-is saved as `rsc-lastboot.log` by `rsc --cleanup` at boot.
+Log timestamps use the device's local timezone (auto-detected from
+`/etc/localtime` or `TZ` env var). UTC offset suffix included.
+Previous-boot log is saved as `rsc-lastboot.log` by `rsc --cleanup` at boot.
 
 ## Installation
 

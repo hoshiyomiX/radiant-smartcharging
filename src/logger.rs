@@ -14,9 +14,11 @@
 //! - Fixed prefix `[<iso8601_with_offset> <LEVEL_padded>  seq=<n>]` —
 //!   backward compatible with grep patterns targeting `[INFO]` or
 //!   message text.
-//! - Timestamps are in **GMT+8 (Asia/Makassar / WITA)** — Indonesia
-//!   central timezone. Format includes the `+08:00` offset suffix so
-//!   the timezone is unambiguous in the log.
+//! - Timestamps use the **device's local timezone** (whatever Android
+//!   is configured to use via `/etc/localtime` or `TZ` env var). Format
+//!   includes the UTC offset suffix (e.g. `+08:00`, `-05:00`, `+00:00`)
+//!   so the timezone is unambiguous in the log regardless of device
+//!   locale.
 //! - Message text comes right after the `]` — preserves existing
 //!   `grep "CUTTING OFF"` / `grep "thermal delimiter"` workflows.
 //! - Zero or more `key=value` pairs are appended after the message,
@@ -32,22 +34,12 @@
 //! `rsc.log` -> `rsc.log.1`, `rsc.log.1` -> `rsc.log.2`, ..., drop the
 //! oldest. Counter is in-memory — no stat() per line.
 
-use chrono::{FixedOffset, Utc};
+use chrono::Local;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-
-/// GMT+8 timezone offset (Asia/Makassar / WITA — Indonesia central).
-/// Used for all log timestamps so the user sees local time, not UTC.
-const WITA_OFFSET_SECS: i32 = 8 * 3600;
-
-/// Build the fixed-offset timezone once. Cheap to construct but
-/// reusing the same value avoids per-line allocation.
-fn wita_tz() -> FixedOffset {
-    FixedOffset::east_opt(WITA_OFFSET_SECS).expect("GMT+8 is a valid offset")
-}
 
 pub struct FileLogger {
     path: PathBuf,
@@ -66,7 +58,7 @@ pub struct FileLogger {
 impl FileLogger {
     pub fn new(path: impl Into<PathBuf>, max_kb: u64, keep: u32) -> Self {
         let path = path.into();
-        // Do mkdir -p ONCE at construction, not on every log line (Issue #4).
+        // Do mkdir -p ONCE at construction, not on every log line.
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -96,12 +88,12 @@ impl FileLogger {
     pub fn log_kv(&self, level: &str, msg: &str, kv: &[(&str, &str)]) {
         let _g = self.inner.lock().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        // Timestamp in GMT+8 (WITA). Format includes offset suffix so
-        // timezone is unambiguous: "2026-06-28T11:40:46+08:00".
-        let ts = Utc::now()
-            .with_timezone(&wita_tz())
-            .format("%Y-%m-%dT%H:%M:%S%:z")
-            .to_string();
+        // Timestamp in device local timezone. chrono::Local reads the
+        // system timezone from /etc/localtime or TZ env var. Format
+        // includes the UTC offset suffix (e.g. "+08:00", "-05:00") so
+        // the timezone is unambiguous regardless of device locale:
+        // "2026-06-28T11:40:46+08:00".
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string();
 
         // Level is left-padded to 5 chars so DEBUG/INFO/WARN/ERROR align
         // vertically when reading the file. Truncate (shouldn't happen

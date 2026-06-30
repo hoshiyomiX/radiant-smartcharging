@@ -174,8 +174,9 @@ log_max_size_kb = 512
 log_keep = 3
 ```
 
-Note: Log timestamps are in GMT+8 (Asia/Makassar / WITA). Previous-boot
-log is saved as `rsc-lastboot.log` by `rsc --cleanup` at boot.
+Note: Log timestamps use the device's local timezone (auto-detected from
+`/etc/localtime` or `TZ` env var). UTC offset suffix included.
+Previous-boot log is saved as `rsc-lastboot.log` by `rsc --cleanup` at boot.
 
 Apply changes: `setprop ctl.restart rsc`
 

@@ -18,5 +18,6 @@ log_file = "/data/adb/rsc/rsc.log"
 log_max_size_kb = 512
 log_keep = 3
 
-# Log timestamps are in GMT+8 (Asia/Makassar / WITA).
+# Log timestamps use the device's local timezone (auto-detected from
+# /etc/localtime or TZ env var). UTC offset suffix included.
 # Previous-boot log is saved as rsc-lastboot.log by --cleanup at boot.
